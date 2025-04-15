@@ -3,14 +3,14 @@ import json
 import re
 from collections import defaultdict, namedtuple
 from logging import getLogger
-from pathlib import Path
 from typing import Any, Optional
+from pathlib import Path
 
 import sqlalchemy as sa
 from packaging.version import Version
 from sqlalchemy import inspect
-from sqlalchemy.dialects.postgresql import DOMAIN, DOUBLE_PRECISION, ENUM
-from sqlalchemy.dialects.postgresql.base import util
+from sqlalchemy import util
+from sqlalchemy.dialects.postgresql import DOUBLE_PRECISION, ENUM
 from sqlalchemy.dialects.postgresql.base import (PGCompiler, PGDDLCompiler,
                                                  PGDialect, PGExecutionContext,
                                                  PGIdentifierPreparer,
@@ -33,7 +33,6 @@ from .commands import (AlterTableAppendCommand, Compression, CopyCommand,
 from .ddl import (CreateMaterializedView, DropMaterializedView,
                   get_table_attributes)
 from typing import List
-from sqlalchemy.engine.reflection import ReflectionDefaults
 
 sa_version = Version(sa.__version__)
 logger = getLogger(__name__)
@@ -291,9 +290,41 @@ REFLECTION_SQL = """\
     FROM svv_external_columns c
     JOIN svv_external_schemas s ON s.schemaname = c.schemaname
     WHERE 1 {schema_clause} {table_clause}
+    UNION
+    SELECT c.database_name || '.' || c.schema_name     AS "schema",
+       c.table_name AS "table_name",
+       c.column_name AS "name",
+       null         AS "encode",
+       c.data_type  AS "type",
+       false        AS "distkey",
+       0            AS "sortkey",
+       null         AS "notnull",
+       null         AS "comment",
+       null         AS "adsrc",
+       c.ordinal_position AS "attnum",
+       c.data_type  AS "format_type",
+       null         AS "default",
+       null         AS "schema_oid",
+       null         AS "table_oid"
+    FROM svv_redshift_columns c
+             JOIN svv_redshift_tables t ON t.table_name = c.table_name AND t.schema_name = c.schema_name
+    WHERE 1 {datashare_clause}{schema_clause} {unambiguous_tablename_clause}
     ORDER BY "schema", "table_name", "attnum";
     """
 
+
+def parse_datashare(schema=None):
+    """try and extract datashare from schema, if any
+
+    returns datashare, schema, found_datashare"""
+    if not schema:
+        return None, schema, False
+    has_datashare = "." in schema and '"' not in schema
+    if not has_datashare:
+        return None, schema, has_datashare
+    datashare = schema.split(".")[0] if has_datashare else ""
+    schema = schema.split(".")[1] if has_datashare else schema
+    return datashare, schema, has_datashare
 
 class RedshiftTypeEngine(TypeEngine):
 
@@ -691,12 +722,14 @@ class RedshiftDialectMixin(DefaultDialect):
         }),
         (sa.schema.Table, {
             "ignore_search_path": False,
+            "datashare":None,
             "diststyle": None,
             "distkey": None,
             "sortkey": None,
             "interleaved_sortkey": None,
         }),
         (sa.schema.Column, {
+            "datashare":None,
             "encode": None,
             "distkey": None,
             "sortkey": None,
@@ -818,8 +851,9 @@ class RedshiftDialectMixin(DefaultDialect):
 
     @reflection.cache
     def get_check_constraints(self, connection, table_name, schema=None, **kw):
+        datashare, _, has_datashare = parse_datashare(schema)
         table_oid = self.get_table_oid(
-            connection, table_name, schema, info_cache=kw.get("info_cache")
+            connection, table_name, schema, info_cache=kw.get("info_cache"), datashare=datashare,
         )
         table_oid = 'NULL' if not table_oid else table_oid
 
@@ -863,6 +897,8 @@ class RedshiftDialectMixin(DefaultDialect):
     def get_table_oid(self, connection, table_name, schema=None, **kw):
         """Fetch the oid for schema.table_name.
         Return None if not found (external table does not have table oid)"""
+
+        datashare, clean_schema, has_datashare = parse_datashare(schema)
         schema_field = '{schema}.'.format(schema=schema) if schema else ""
 
         try:
@@ -884,22 +920,47 @@ class RedshiftDialectMixin(DefaultDialect):
                 "AND schemaname = '{schema}'".format(schema=schema)
                 if schema else ""
             )
-            result = connection.execute(
-                sa.text(
-                    """
-                    SELECT
-                        1
-                    FROM svv_external_tables
-                    WHERE
-                        tablename = '{table_name}'
-                        {schema_filter}
-                    LIMIT 1;
-                    """.format(
-                        schema_filter=schema_filter,
-                        table_name=table_name
+            if not has_datashare:
+                result = connection.execute(
+                    sa.text(
+                        """
+                        SELECT
+                            1
+                        FROM svv_external_tables
+                        WHERE
+                            tablename = '{table_name}'
+                            {schema_filter}
+                        LIMIT 1;
+                        """.format(
+                            schema_filter=schema_filter,
+                            table_name=table_name
+                        )
                     )
                 )
-            )
+            else:
+                datashare_filter = "AND database_name = '{datashare}'".format(datashare=datashare)
+                schema_filter = (
+                    "AND schema_name = '{schema}'".format(schema=clean_schema)
+                    if clean_schema else ""
+                )
+                result = connection.execute(
+                    sa.text(
+                        """
+                        SELECT
+                            1
+                        FROM svv_redshift_tables
+                        WHERE
+                            table_name = '{table_name}'
+                            {schema_filter}
+                            {datashare_filter}
+                        LIMIT 1;
+                        """.format(
+                            schema_filter=schema_filter,
+                            datashare_filter=datashare_filter,
+                            table_name=table_name
+                        )
+                    )
+                )
             if result.scalar() is not None:
                 return None
             raise e
@@ -1066,6 +1127,7 @@ class RedshiftDialectMixin(DefaultDialect):
         distkeys = [col.name for col in columns if col.distkey]
         distkey = distkeys[0] if distkeys else None
         return {
+            'redshift_datashare': None,
             'redshift_diststyle': table.diststyle,
             'redshift_distkey': distkey,
             'redshift_sortkey': sortkey,
@@ -1341,9 +1403,21 @@ class RedshiftDialectMixin(DefaultDialect):
     @reflection.cache
     def _get_all_relation_info(self, connection, **kw):
         schema = kw.get('schema', None)
+        # This goes before using schema because it does cleanup
+        datashare, _, has_datashare = parse_datashare(schema)
+        datashare_clause = (
+                "AND s.database_name = '{datashare}'".format(datashare=datashare) if has_datashare else ""
+        )
         schema_clause = (
             "AND schema = '{schema}'".format(schema=schema) if schema else ""
         )
+
+        ## This could also be passed but, if not then present in the schema it needs to be added
+        ## because subsequent reflective calls do not pass through custom attributes.
+        # datashare = kw.get('datashare', None)
+
+
+
 
         table_name = kw.get('table_name', None)
         table_clause = (
@@ -1389,8 +1463,27 @@ class RedshiftDialectMixin(DefaultDialect):
             JOIN svv_external_schemas s ON s.schemaname = t.schemaname
             JOIN pg_catalog.pg_user u ON u.usesysid = s.esowner
         where 1 {schema_clause} {table_clause}
+        UNION
+        SELECT
+            'r' AS relkind,
+            NULL AS schema_oid,  -- Not available in svv_redshift_schemas
+            s.database_name || '.' || s.schema_name AS schema,
+            NULL AS rel_oid,
+            t.table_name AS relname,
+            NULL AS diststyle,
+            NULL AS owner_id,
+            NULL AS owner_name,
+            NULL AS view_definition,
+            NULL AS privileges
+        FROM
+            svv_redshift_tables t
+            LEFT JOIN svv_redshift_schemas s ON s.schema_name = t.schema_name
+        WHERE 1
+            {datashare_clause} {schema_clause} {table_clause}
         ORDER BY "relkind", "schema_oid", "schema";
-        """.format(schema_clause=schema_clause, table_clause=table_clause)))
+
+       
+        """.format(schema_clause=schema_clause, table_clause=table_clause,datashare_clause=datashare_clause)))
         relations = {}
         for rel in result:
             key = RelationKey(rel.relname, rel.schema, connection)
@@ -1403,8 +1496,15 @@ class RedshiftDialectMixin(DefaultDialect):
     def _get_schema_column_info(self, connection, **kw):
         schema = kw.get('schema', None)
         schema = self.unquote(schema)
+        # datashare = kw.get('datashare', None)
+        datashare, _, has_datashare = parse_datashare(schema)
         schema_clause = (
             "AND schema = '{schema}'".format(schema=schema) if schema else ""
+        )
+
+
+        datashare_clause = (
+                "AND c.database_name = '{datashare}'".format(datashare=datashare) if datashare else ""
         )
 
         table_name = kw.get('table_name', None)
@@ -1414,10 +1514,18 @@ class RedshiftDialectMixin(DefaultDialect):
             ) if table_name else ""
         )
 
+        unambiguous_tablename_clause = (
+            "AND c.table_name = '{table}'".format(
+                table=table_name
+            ) if table_name else ""
+        )
+
         all_columns = defaultdict(list)
         result = connection.execute(sa.text(REFLECTION_SQL.format(
             schema_clause=schema_clause,
-            table_clause=table_clause
+            table_clause=table_clause,
+            unambiguous_tablename_clause=unambiguous_tablename_clause,
+            datashare_clause=datashare_clause,
         )))
 
         for col in result:
@@ -1429,13 +1537,25 @@ class RedshiftDialectMixin(DefaultDialect):
     @reflection.cache
     def _get_all_constraint_info(self, connection, **kw):
         schema = kw.get('schema', None)
+        #datashare = kw.get('datashare', None)
+        datashare, _, has_datashare = parse_datashare(schema)
         schema_clause = (
             "AND schema = '{schema}'".format(schema=schema) if schema else ""
+        )
+
+
+        datashare_clause = (
+                "AND c.database_name = '{datashare}'".format(datashare=datashare) if datashare else ""
         )
 
         table_name = kw.get('table_name', None)
         table_clause = (
             "AND table_name = '{table}'".format(
+                table=table_name
+            ) if table_name else ""
+        )
+        unambiguous_table_clause = (
+            "AND c.table_name = '{table}'".format(
                 table=table_name
             ) if table_name else ""
         )
@@ -1476,8 +1596,25 @@ class RedshiftDialectMixin(DefaultDialect):
             svv_external_columns c
             JOIN svv_external_schemas s ON s.schemaname = c.schemaname
         where 1 {schema_clause} {table_clause}
+        UNION
+        SELECT
+            c.database_name || '.' || c.schema_name AS "schema",
+            c.table_name AS "table_name",
+            'p' AS "contype",
+            c.table_name || '_pkey' AS "conname",
+            array[1::SMALLINT] AS "conkey",
+            1 AS "attnum",
+            c.column_name AS "attname",
+            'PRIMARY KEY (' || c.column_name || ')'::VARCHAR(512) AS "condef",
+            null AS "schema_oid",
+            null AS "rel_oid"
+        FROM
+            svv_redshift_columns c
+            JOIN svv_redshift_tables t ON t.schema_name = c.schema_name AND t.table_name = c.table_name
+        WHERE 1 {datashare_clause} {schema_clause} {unambiguous_table_clause}
         ORDER BY "schema", "table_name"
-        """.format(schema_clause=schema_clause, table_clause=table_clause)))
+        """.format(schema_clause=schema_clause, table_clause=table_clause,
+                   unambiguous_table_clause=unambiguous_table_clause, datashare_clause=datashare_clause)))
         all_constraints = defaultdict(list)
         for con in result:
             key = RelationKey(con.table_name, con.schema, connection)
