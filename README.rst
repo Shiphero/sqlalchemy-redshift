@@ -1,5 +1,17 @@
-sqlalchemy-redshift
+sqlalchemy-redshift (Maintentance fork)
 ===================
+
+.. important::
+
+   **Maintenance Fork Notice**
+
+   This is a maintenance fork maintained by `ShipHero <https://shiphero.com/>`_ (`GitHub <https://github.com/Shiphero>`_).
+
+   We are not the original authors of this code. It was forked from the original `SQLAlchemy Redshift <https://github.com/sqlalchemy-redshift/sqlalchemy-redshift>`_ project which is no longer actively maintained.
+
+   We maintain this fork to keep it working with our stack and needs. While we welcome contributions and PRs, please understand our response time and priorities may be limited to our specific use cases.
+
+   All code added follows the original licensing terms.
 
 Amazon Redshift dialect for SQLAlchemy.
 
